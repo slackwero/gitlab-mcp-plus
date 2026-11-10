@@ -1,9 +1,14 @@
 # gitlab-mcp-plus
 
+[![platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue)](#requirements)
+[![go](https://img.shields.io/badge/go-%E2%89%A51.26-00ADD8)](go.mod)
+[![MCP tools](https://img.shields.io/badge/MCP%20tools-44-blue)](#tools)
+[![GitLab](https://img.shields.io/badge/GitLab-.com%20%7C%20self--managed-FC6D26)](#self-managed-gitlab)
+[![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+
 [![CI](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/ci.yml)
 [![Security](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/security.yml/badge.svg)](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/security.yml)
 [![CodeQL](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/codeql.yml/badge.svg)](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/codeql.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 An [MCP](https://modelcontextprotocol.io) server that gives AI assistants (Claude Code, Cursor and any other MCP client) the **security, compliance and GitLab Duo** side of GitLab: vulnerability triage and bulk actions, security policies, compliance violations, dependencies (SBOM), scanner coverage, Duo usage, seats and credits, AI governance, and group inventory and audit.
 
