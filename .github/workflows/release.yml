@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload its assets
+      id-token: write # sign the build provenance with a Sigstore certificate
+      attestations: write # store the provenance attestation
+      artifact-metadata: write # record the attested artifacts
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,6 +49,18 @@ jobs:
             (cd dist && sha256sum "$name" > "${name}.sha256")
           done
           ls -l dist
+
+      # Signed SLSA build provenance for each binary, verifiable with
+      # `gh attestation verify <file> --repo slackwero/gitlab-mcp-plus`. It runs
+      # before publishing, so a failed attestation never ships a release.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/gitlab-mcp-plus-linux-amd64
+            dist/gitlab-mcp-plus-linux-arm64
+            dist/gitlab-mcp-plus-darwin-amd64
+            dist/gitlab-mcp-plus-darwin-arm64
 
       - name: Publish the GitHub Release
         env:
