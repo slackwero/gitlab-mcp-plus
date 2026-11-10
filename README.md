@@ -105,6 +105,12 @@ rm "${ASSET}.sha256"
 
 Without `sudo`, use a directory in your home instead, for example `mkdir -p ~/.local/bin && mv "${ASSET}" ~/.local/bin/gitlab-mcp-plus`.
 
+Releases after v1.0.0 also carry a signed build provenance attestation. With the [GitHub CLI](https://cli.github.com), verify that the binary was built by this repository's release workflow (run it before `chmod`/`mv`):
+
+```bash
+gh attestation verify "${ASSET}" --repo slackwero/gitlab-mcp-plus
+```
+
 **macOS:** if you downloaded the file with a browser, Gatekeeper may block it the first time because it is not signed. Allow it with:
 
 ```bash
@@ -376,6 +382,8 @@ Tools that accept `project_path` or `group_path` take exactly one of the two, as
 
 ## Security
 
+To report a vulnerability, see [SECURITY.md](SECURITY.md): use a private report, never a public issue.
+
 - **Untrusted content and prompt injection.** Results include text written by other people: vulnerability descriptions, merge request titles, audit event details. Text crafted to look like instructions can push an assistant to call a write tool, for example to dismiss vulnerabilities. Clients that honour MCP annotations ask before running write tools, but auto-approval removes that check. If you do not need to change data, use `--read-only` (and a `read_api` token); otherwise, keep confirmations on for write tools.
 - **Least privilege.** Give the token an expiration date, and for shared setups prefer a group access token or a service account limited to the groups it needs. `--tools` narrows the server to the tools a use case needs.
 - **Token storage.** The client keeps the token in its own configuration: Claude Code in `~/.claude.json`, Cursor in `~/.cursor/mcp.json` (written with `0600`). Project-scope installs store a reference to `GITLAB_TOKEN`, never the token. `--print-config` never prints the token.
@@ -452,15 +460,15 @@ Every push and pull request, and a weekly schedule, run:
 | [CodeQL](.github/workflows/codeql.yml) | Static analysis (SAST) with the `security-extended` queries; results under **Security → Code scanning** |
 | [Dependency review](.github/workflows/dependency-review.yml) | Pull requests that add or upgrade a dependency with a known vulnerability |
 
-Dependabot keeps the Go modules and the GitHub Actions up to date.
+Dependabot keeps the Go modules and the GitHub Actions up to date. Changes reach `main` through a pull request, which can merge once CI, Security, CodeQL and Dependency review pass.
 
 ### Releasing
 
-Push a semver tag; the [Release workflow](.github/workflows/release.yml) runs the tests, builds the four binaries with their version information and publishes them with their checksums as a GitHub Release:
+Push a semver tag from `main`; the [Release workflow](.github/workflows/release.yml) runs the tests, builds the four binaries with their version information, attests their build provenance and publishes them with their checksums as a GitHub Release:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag -a v1.2.3 -m "gitlab-mcp-plus v1.2.3"
+git push origin v1.2.3
 ```
 
 ## License
