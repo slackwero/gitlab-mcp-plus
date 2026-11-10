@@ -1,0 +1,19 @@
+# Compiled binaries (published through GitHub Releases)
+/gitlab-mcp-plus
+/gitlab-mcp-plus-*
+*.sha256
+dist/
+
+# Local tooling
+.go-mod-cache/
+.env
+*.bak
+.DS_Store
+
+# Claude Code / AI assistant files (local only, never published)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.mcp.json
+.superpowers/
+docs/superpowers/

@@ -1,0 +1,1012 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
+)
+
+// toolHandler is a tool handler as a method expression of *App.
+type toolHandler func(*App, context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)
+
+func TestVulnerabilityWriteTools_RejectPartiallyInvalidLists(t *testing.T) {
+	// A bulk write acts on exactly the list it was given or not at all: an
+	// invalid entry is never dropped from the request.
+	writeTools := []struct {
+		name    string
+		handler toolHandler
+		param   string
+		args    map[string]any // valid values for every other argument
+	}{
+		{"vulnerabilities_bulk_dismiss", (*App).handleVulnerabilitiesBulkDismiss, "ids", map[string]any{}},
+		{"vulnerabilities_override_severity", (*App).handleVulnerabilitiesOverrideSeverity, "ids",
+			map[string]any{"severity": "LOW", "comment": "not exploitable"}},
+		{"vulnerabilities_link_issue", (*App).handleVulnerabilitiesLinkIssue, "ids",
+			map[string]any{"issue_project_path": "acme/app", "issue_iid": "12"}},
+		{"vulnerabilities_set_due_date", (*App).handleVulnerabilitiesSetDueDate, "finding_uuids",
+			map[string]any{"project_path": "acme/app", "due_date": "2026-12-31"}},
+		{"start_vulnerability_workflow", (*App).handleStartVulnerabilityWorkflow, "finding_uuids",
+			map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1"}},
+		{"start_vulnerability_workflow/severities", (*App).handleStartVulnerabilityWorkflow, "severities",
+			map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "all_findings": true}},
+	}
+	lists := []struct {
+		name  string
+		value any
+		entry int // 1-based index of the first invalid entry; 0 when not an array
+	}{
+		{"number then string", []any{float64(7), "8"}, 1},
+		{"only numbers", []any{float64(7), float64(8)}, 1},
+		{"trailing empty string", []any{"7", ""}, 2},
+		{"trailing blank string", []any{"7", "  "}, 2},
+		{"string instead of array", "7", 0},
+	}
+	for _, wt := range writeTools {
+		for _, list := range lists {
+			t.Run(wt.name+"/"+list.name, func(t *testing.T) {
+				args := maps.Clone(wt.args)
+				args[wt.param] = list.value
+				app, fake := newScriptedGitLab(t, nil, nil)
+				res, err := wt.handler(app, context.Background(), callTool(args))
+
+				want := fmt.Sprintf("%s must contain only non-empty strings (entry %d is not)", wt.param, list.entry)
+				if list.entry == 0 {
+					want = wt.param + " must be an array of strings"
+				}
+				if msg := errorText(t, res, err); msg != want {
+					t.Errorf("message = %q, want %q", msg, want)
+				}
+				if n := len(fake.graphQLCalls()); n != 0 {
+					t.Errorf("%d requests were sent", n)
+				}
+			})
+		}
+	}
+}
+
+func TestVulnerabilitiesBulkDismiss_SendsNormalizedIDs(t *testing.T) {
+	app, fake := newScriptedGitLab(t, []string{`{"data":{"vulnerabilitiesDismiss":{
+	  "vulnerabilities":[{"id":"gid://gitlab/Vulnerability/7","state":"DISMISSED"}],"errors":[]}}}`}, nil)
+	res, err := app.handleVulnerabilitiesBulkDismiss(context.Background(), callTool(map[string]any{
+		"ids": []any{"7", "gid://gitlab/Vulnerability/8"}, "comment": "noise", "dismissal_reason": "FALSE_POSITIVE",
+	}))
+	if text := resultText(t, res, err); !strings.Contains(text, "DISMISSED") {
+		t.Errorf("result = %s", text)
+	}
+	vars := fake.graphQLCalls()[0].Variables
+	wantIDs := []any{"gid://gitlab/Vulnerability/7", "gid://gitlab/Vulnerability/8"}
+	if !reflect.DeepEqual(vars["ids"], wantIDs) || vars["comment"] != "noise" || vars["dismissalReason"] != "FALSE_POSITIVE" {
+		t.Errorf("variables = %v", vars)
+	}
+}
+
+func TestVulnerabilitiesBulkDismiss_RejectsOver100WithoutCallingGitLab(t *testing.T) {
+	app, fake := newScriptedGitLab(t, nil, nil)
+	ids := make([]any, 101)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i + 1)
+	}
+	res, err := app.handleVulnerabilitiesBulkDismiss(context.Background(), callTool(map[string]any{"ids": ids}))
+	if msg := errorText(t, res, err); msg != "ids accepts at most 100 entries (got 101)" {
+		t.Errorf("message = %q", msg)
+	}
+	if n := len(fake.graphQLCalls()); n != 0 {
+		t.Errorf("%d requests were sent", n)
+	}
+}
+
+func TestVulnerabilitiesBulkDismiss_PayloadErrorsAreToolErrors(t *testing.T) {
+	app, _ := newScriptedGitLab(t, []string{`{"data":{"vulnerabilitiesDismiss":{
+	  "vulnerabilities":[],"errors":["Vulnerability 7 cannot be dismissed"]}}}`}, nil)
+	res, err := app.handleVulnerabilitiesBulkDismiss(context.Background(), callTool(map[string]any{"ids": []any{"7"}}))
+	if msg := errorText(t, res, err); !strings.Contains(msg, "Vulnerability 7 cannot be dismissed") {
+		t.Errorf("message = %q", msg)
+	}
+}
+
+func TestVulnerabilitiesMutations_MissingPayloadIsNotSuccess(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		call     func(app *App) (string, error)
+	}{
+		{"dismiss without payload", `{"data":{"vulnerabilitiesDismiss":null}}`, nil},
+		{"dismiss without list", `{"data":{"vulnerabilitiesDismiss":{"errors":[]}}}`, nil},
+		{"severity without payload", `{"data":{}}`, nil},
+		{"severity without list", `{"data":{"vulnerabilitiesSeverityOverride":{"vulnerabilities":null,"errors":[]}}}`, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app, _ := newScriptedGitLab(t, []string{tc.response}, nil)
+			var msg string
+			if strings.HasPrefix(tc.name, "dismiss") {
+				res, err := app.handleVulnerabilitiesBulkDismiss(context.Background(), callTool(map[string]any{"ids": []any{"7"}}))
+				msg = errorText(t, res, err)
+			} else {
+				res, err := app.handleVulnerabilitiesOverrideSeverity(context.Background(), callTool(map[string]any{
+					"ids": []any{"7"}, "severity": "LOW", "comment": "why",
+				}))
+				msg = errorText(t, res, err)
+			}
+			if !strings.Contains(msg, "Unexpected GitLab response") {
+				t.Errorf("message = %q", msg)
+			}
+		})
+	}
+}
+
+func TestVulnerabilitiesOverrideSeverity_RequiresComment(t *testing.T) {
+	app, fake := newScriptedGitLab(t, nil, nil)
+	res, err := app.handleVulnerabilitiesOverrideSeverity(context.Background(), callTool(map[string]any{
+		"ids": []any{"7"}, "severity": "LOW", "comment": "   ",
+	}))
+	if msg := errorText(t, res, err); msg != "comment is required" {
+		t.Errorf("message = %q", msg)
+	}
+	if len(fake.graphQLCalls()) != 0 {
+		t.Errorf("must not call GitLab")
+	}
+}
+
+func TestVulnerabilitiesOverrideSeverity_SendsVariables(t *testing.T) {
+	app, fake := newScriptedGitLab(t, []string{`{"data":{"vulnerabilitiesSeverityOverride":{
+	  "vulnerabilities":[{"id":"gid://gitlab/Vulnerability/7","severity":"LOW"}],"errors":[]}}}`}, nil)
+	res, err := app.handleVulnerabilitiesOverrideSeverity(context.Background(), callTool(map[string]any{
+		"ids": []any{"7"}, "severity": "LOW", "comment": "not exploitable",
+	}))
+	resultText(t, res, err)
+	vars := fake.graphQLCalls()[0].Variables
+	if vars["severity"] != "LOW" || vars["comment"] != "not exploitable" ||
+		!reflect.DeepEqual(vars["ids"], []any{"gid://gitlab/Vulnerability/7"}) {
+		t.Errorf("variables = %v", vars)
+	}
+}
+
+func TestVulnerabilitiesLinkIssue_ResolvesIssueThenLinks(t *testing.T) {
+	app, fake := newScriptedGitLab(t, []string{
+		`{"data":{"project":{"issue":{"id":"gid://gitlab/Issue/900","iid":"12"}}}}`,
+		`{"data":{"vulnerabilityIssueLinkCreate":{"issueLinks":[{"id":"gid://gitlab/Vulnerabilities::IssueLink/1","linkType":"RELATED"}],"errors":[]}}}`,
+	}, nil)
+	res, err := app.handleVulnerabilitiesLinkIssue(context.Background(), callTool(map[string]any{
+		"ids": []any{"7"}, "issue_project_path": "acme/app", "issue_iid": "12",
+	}))
+	resultText(t, res, err)
+	calls := fake.graphQLCalls()
+	if len(calls) != 2 || calls[0].Variables["iid"] != "12" || calls[1].Variables["issueId"] != "gid://gitlab/Issue/900" {
+		t.Errorf("calls = %+v", calls)
+	}
+}
+
+func TestVulnerabilitiesLinkIssue_UnknownIssueStopsBeforeMutation(t *testing.T) {
+	app, fake := newScriptedGitLab(t, []string{`{"data":{"project":{"issue":null}}}`}, nil)
+	res, err := app.handleVulnerabilitiesLinkIssue(context.Background(), callTool(map[string]any{
+		"ids": []any{"7"}, "issue_project_path": "acme/app", "issue_iid": "99",
+	}))
+	if msg := errorText(t, res, err); msg != "Issue #99 not found in project 'acme/app'" {
+		t.Errorf("message = %q", msg)
+	}
+	if n := len(fake.graphQLCalls()); n != 1 {
+		t.Errorf("requests = %d, want only the issue lookup", n)
+	}
+}
+
+func TestVulnerabilitiesLinkIssue_AcceptsWholeNumberIID(t *testing.T) {
+	app, fake := newScriptedGitLab(t, []string{
+		`{"data":{"project":{"issue":{"id":"gid://gitlab/Issue/900","iid":"12"}}}}`,
+		`{"data":{"vulnerabilityIssueLinkCreate":{"issueLinks":[{"id":"gid://gitlab/Vulnerabilities::IssueLink/1","linkType":"RELATED"}],"errors":[]}}}`,
+	}, nil)
+	res, err := app.handleVulnerabilitiesLinkIssue(context.Background(), callTool(map[string]any{
+		"ids": []any{"7"}, "issue_project_path": "acme/app", "issue_iid": float64(12),
+	}))
+	resultText(t, res, err)
+	calls := fake.graphQLCalls()
+	if len(calls) != 2 || calls[0].Variables["iid"] != "12" || calls[1].Variables["issueId"] != "gid://gitlab/Issue/900" {
+		t.Errorf("calls = %+v", calls)
+	}
+}
+
+func TestVulnerabilitiesLinkIssue_RejectsAnyOtherIIDType(t *testing.T) {
+	for name, value := range map[string]any{
+		"fraction": 12.5,
+		"boolean":  true,
+		"object":   map[string]any{"iid": "12"},
+		"array":    []any{"12"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, fake := newScriptedGitLab(t, nil, nil)
+			res, err := app.handleVulnerabilitiesLinkIssue(context.Background(), callTool(map[string]any{
+				"ids": []any{"7"}, "issue_project_path": "acme/app", "issue_iid": value,
+			}))
+			if msg := errorText(t, res, err); msg != "issue_iid must be a string or integer" {
+				t.Errorf("message = %q", msg)
+			}
+			if n := len(fake.graphQLCalls()); n != 0 {
+				t.Errorf("%d requests were sent", n)
+			}
+		})
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_BuildsUpdates(t *testing.T) {
+	const response = `{"data":{"bulkSetVulnerabilityFindingsDueDates":{"assigned":2,"removed":0,"skipped":0,"errors":[]}}}`
+	app, fake := newScriptedGitLab(t, []string{response}, nil)
+	res, err := app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "finding_uuids": []any{"u-1", "u-2"}, "due_date": "2026-12-31",
+	}))
+	resultText(t, res, err)
+	want := []any{
+		map[string]any{"findingUuid": "u-1", "dueDate": "2026-12-31"},
+		map[string]any{"findingUuid": "u-2", "dueDate": "2026-12-31"},
+	}
+	if got := fake.graphQLCalls()[0].Variables["updates"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("updates = %v", got)
+	}
+
+	// Invalid date format: does not call GitLab.
+	app, fake = newScriptedGitLab(t, nil, nil)
+	res, err = app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "finding_uuids": []any{"u-1"}, "due_date": "31/12/2026",
+	}))
+	if msg := errorText(t, res, err); msg != "due_date must be YYYY-MM-DD" || len(fake.graphQLCalls()) != 0 {
+		t.Errorf("message = %q", msg)
+	}
+
+	// More than 1000 UUIDs: rejected locally (Review Focus 2).
+	uuids := make([]any, 1001)
+	for i := range uuids {
+		uuids[i] = "u-" + strconv.Itoa(i)
+	}
+	res, err = app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "finding_uuids": uuids, "due_date": "2026-12-31",
+	}))
+	if msg := errorText(t, res, err); msg != "finding_uuids accepts at most 1000 entries (got 1001)" || len(fake.graphQLCalls()) != 0 {
+		t.Errorf("message = %q", msg)
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_SkippedAndFindingErrorsAreAResult(t *testing.T) {
+	app, _ := newScriptedGitLab(t, []string{`{"data":{"bulkSetVulnerabilityFindingsDueDates":{
+	  "assigned":1,"removed":0,"skipped":1,
+	  "errors":[{"code":"NOT_FOUND","findingUuid":"u-2","message":"Finding not found"}]}}}`}, nil)
+	res, err := app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "finding_uuids": []any{"u-1", "u-2"}, "due_date": "2026-12-31",
+	}))
+	text := resultText(t, res, err)
+	for _, want := range []string{`"skipped": 1`, `"assigned": 1`, "NOT_FOUND", "u-2"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("result lacks %q: %s", want, text)
+		}
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_MissingPayloadIsNotSuccess(t *testing.T) {
+	for _, response := range []string{
+		`{"data":{"bulkSetVulnerabilityFindingsDueDates":null}}`,
+		`{"data":{"bulkSetVulnerabilityFindingsDueDates":{"errors":[]}}}`,
+	} {
+		app, _ := newScriptedGitLab(t, []string{response}, nil)
+		res, err := app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(map[string]any{
+			"project_path": "acme/app", "finding_uuids": []any{"u-1"}, "due_date": "2026-12-31",
+		}))
+		if msg := errorText(t, res, err); !strings.Contains(msg, "Unexpected GitLab response") {
+			t.Errorf("message = %q for %s", msg, response)
+		}
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_NullCountsKeepGitLabErrors(t *testing.T) {
+	// assigned/removed/skipped are nullable: when GitLab rejects the whole
+	// request, its errors are the only explanation the client gets.
+	app, _ := newScriptedGitLab(t, []string{`{"data":{"bulkSetVulnerabilityFindingsDueDates":{
+	  "assigned":null,"removed":null,"skipped":null,
+	  "errors":[{"code":"FORBIDDEN","findingUuid":null,"message":"You are not allowed to update due dates"},
+	            {"code":"NOT_FOUND","findingUuid":"u-2","message":"Finding not found"}]}}}`}, nil)
+	res, err := app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "finding_uuids": []any{"u-1", "u-2"}, "due_date": "2026-12-31",
+	}))
+	want := `Unexpected GitLab response for vulnerabilities_set_due_date: missing or non-numeric "assigned"` +
+		` (GitLab errors: You are not allowed to update due dates; Finding not found)`
+	if msg := errorText(t, res, err); msg != want {
+		t.Errorf("message = %q\nwant      %q", msg, want)
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_RequiresExplicitIntent(t *testing.T) {
+	const required = "due_date is required; pass remove_due_date=true to remove the due date"
+	const both = "provide either due_date or remove_due_date, not both"
+	tests := []struct {
+		name string
+		args map[string]any // added to a valid project_path and finding_uuids
+		want string
+	}{
+		{"neither argument", map[string]any{}, required},
+		{"null due_date", map[string]any{"due_date": nil}, required},
+		{"remove_due_date false without a date", map[string]any{"remove_due_date": false}, required},
+		{"null due_date and remove_due_date false", map[string]any{"due_date": nil, "remove_due_date": false}, required},
+		{"both", map[string]any{"due_date": "2026-12-31", "remove_due_date": true}, both},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := map[string]any{"project_path": "acme/app", "finding_uuids": []any{"u-1"}}
+			maps.Copy(args, tt.args)
+			app, fake := newScriptedGitLab(t, nil, nil)
+			res, err := app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(args))
+			if msg := errorText(t, res, err); msg != tt.want {
+				t.Errorf("message = %q, want %q", msg, tt.want)
+			}
+			if n := len(fake.graphQLCalls()); n != 0 {
+				t.Errorf("%d requests were sent", n)
+			}
+		})
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_DeclaresRemoveFlag(t *testing.T) {
+	tool := registeredTools(t)["vulnerabilities_set_due_date"]
+	prop, _ := tool.InputSchema.Properties["remove_due_date"].(map[string]any)
+	if prop["type"] != "boolean" {
+		t.Errorf("remove_due_date schema = %v, want a boolean parameter", tool.InputSchema.Properties["remove_due_date"])
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_MalformedDueDateNeverClearsDates(t *testing.T) {
+	for name, value := range map[string]any{
+		"number":       float64(20261231),
+		"object":       map[string]any{"date": "2026-12-31"},
+		"empty string": "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, fake := newScriptedGitLab(t, nil, nil)
+			res, err := app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(map[string]any{
+				"project_path": "acme/app", "finding_uuids": []any{"u-1"}, "due_date": value,
+			}))
+			if msg := errorText(t, res, err); msg != "due_date must be YYYY-MM-DD" {
+				t.Errorf("message = %q", msg)
+			}
+			if n := len(fake.graphQLCalls()); n != 0 {
+				t.Errorf("%d requests were sent", n)
+			}
+		})
+	}
+}
+
+func TestVulnerabilitiesSetDueDate_RemoveDueDateSendsNull(t *testing.T) {
+	for name, args := range map[string]map[string]any{
+		"remove_due_date only":           {"remove_due_date": true},
+		"remove_due_date with null date": {"remove_due_date": true, "due_date": nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, fake := newScriptedGitLab(t, []string{`{"data":{"bulkSetVulnerabilityFindingsDueDates":{"assigned":0,"removed":2,"skipped":0,"errors":[]}}}`}, nil)
+			maps.Copy(args, map[string]any{"project_path": "acme/app", "finding_uuids": []any{"u-1", "u-2"}})
+			res, err := app.handleVulnerabilitiesSetDueDate(context.Background(), callTool(args))
+			resultText(t, res, err)
+			updates := fake.lastCall(t).Variables["updates"].([]any)
+			if len(updates) != 2 {
+				t.Fatalf("updates = %v, want one per finding", updates)
+			}
+			for _, u := range updates {
+				if v, present := u.(map[string]any)["dueDate"]; !present || v != nil {
+					t.Errorf("dueDate = %v (present: %t), want explicit null", v, present)
+				}
+			}
+		})
+	}
+}
+
+const projectIDResponse = `{"data":{"project":{"id":"gid://gitlab/Project/9"}}}`
+
+func TestStartVulnerabilityWorkflow_RequiresExplicitScope(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{"no uuids and no all_findings", map[string]any{},
+			"finding_uuids is required; pass all_findings=true to process every finding in the project"},
+		{"both at once", map[string]any{"finding_uuids": []any{"u-1"}, "all_findings": true},
+			"provide either finding_uuids or all_findings, not both"},
+		{"severities without a scope", map[string]any{"severities": []any{"CRITICAL"}},
+			"finding_uuids is required; pass all_findings=true to process every finding in the project"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app, fake := newScriptedGitLab(t, nil, nil)
+			tt.args["project_path"] = "acme/app"
+			tt.args["workflow"] = "SAST_FP_DETECTION_V1"
+			res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(tt.args))
+			if msg := errorText(t, res, err); msg != tt.want {
+				t.Errorf("message = %q", msg)
+			}
+			if n := len(fake.graphQLCalls()); n != 0 {
+				t.Errorf("%d requests were sent; must not call GitLab", n)
+			}
+		})
+	}
+}
+
+func TestStartVulnerabilityWorkflow_RejectsOver1000UUIDs(t *testing.T) {
+	app, fake := newScriptedGitLab(t, nil, nil)
+	uuids := make([]any, 1001)
+	for i := range uuids {
+		uuids[i] = "u-" + strconv.Itoa(i)
+	}
+	res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "RESOLVE_SAST_VULNERABILITY_V1", "finding_uuids": uuids,
+	}))
+	if msg := errorText(t, res, err); msg != "finding_uuids accepts at most 1000 entries (got 1001)" || len(fake.graphQLCalls()) != 0 {
+		t.Errorf("message = %q", msg)
+	}
+}
+
+func TestStartVulnerabilityWorkflow_SendsSelection(t *testing.T) {
+	const started = `{"data":{"startVulnerabilityWorkflow":{"execution":{"executionId":"e-1","status":"CREATED"},"errorReason":null,"errors":[]}}}`
+	app, fake := newScriptedGitLab(t, []string{projectIDResponse, started}, nil)
+	res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "finding_uuids": []any{"u-1", "u-2"},
+	}))
+	if got := decodeStartResult(t, resultText(t, res, err)); got.Execution["executionId"] != "e-1" {
+		t.Errorf("execution = %v", got.Execution)
+	}
+	vars := fake.graphQLCalls()[1].Variables
+	if vars["projectId"] != "gid://gitlab/Project/9" || !reflect.DeepEqual(vars["findingUuids"], []any{"u-1", "u-2"}) {
+		t.Errorf("variables = %v", vars)
+	}
+	if _, present := vars["severities"]; present {
+		t.Errorf("severities must not be sent")
+	}
+
+	// all_findings=true: findingUuids is not sent.
+	app, fake = newScriptedGitLab(t, []string{projectIDResponse, started}, nil)
+	res, err = app.handleStartVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "all_findings": true, "severities": []any{"CRITICAL"},
+	}))
+	resultText(t, res, err)
+	vars = fake.graphQLCalls()[1].Variables
+	if _, present := vars["findingUuids"]; present || !reflect.DeepEqual(vars["severities"], []any{"CRITICAL"}) {
+		t.Errorf("variables = %v", vars)
+	}
+}
+
+func TestStartVulnerabilityWorkflow_ErrorReasonIsToolError(t *testing.T) {
+	const rejected = `{"data":{"startVulnerabilityWorkflow":{"execution":null,"errorReason":"ALREADY_STARTED","errors":["Workflow execution is already running"]}}}`
+	app, _ := newScriptedGitLab(t, []string{projectIDResponse, rejected}, nil)
+	res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "finding_uuids": []any{"u-1"},
+	}))
+	want := "Failed to start workflow (ALREADY_STARTED): Workflow execution is already running"
+	if msg := errorText(t, res, err); msg != want {
+		t.Errorf("message = %q", msg)
+	}
+}
+
+func TestGetVulnerabilityWorkflow_NoExecution(t *testing.T) {
+	app, _ := newFakeGitLab(t, `{"data":{"project":{"vulnerabilityWorkflowExecution":null}}}`)
+	res, err := app.handleGetVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SECRETS_FP_DETECTION_V1",
+	}))
+	if msg := errorText(t, res, err); msg != "No SECRETS_FP_DETECTION_V1 execution found for project 'acme/app'" {
+		t.Errorf("message = %q", msg)
+	}
+}
+
+// workflowStarted is a successful startVulnerabilityWorkflow payload.
+const workflowStarted = `{"data":{"startVulnerabilityWorkflow":{"execution":{"executionId":"e-1","status":"CREATED"},"errorReason":null,"errors":[]}}}`
+
+func TestStartVulnerabilityWorkflow_AllFindingsIsAStrictBoolean(t *testing.T) {
+	// Only a JSON true opts in to every finding. Null counts as absent; any
+	// other type is rejected instead of being read as false or true.
+	const required = "finding_uuids is required; pass all_findings=true to process every finding in the project"
+	const notBoolean = "all_findings must be a boolean"
+	tests := []struct {
+		name string
+		args map[string]any // added to a valid project_path and workflow
+		want string
+	}{
+		{"null is absent", map[string]any{"all_findings": nil}, required},
+		{"false is not an opt-in", map[string]any{"all_findings": false}, required},
+		{"string true", map[string]any{"all_findings": "true"}, notBoolean},
+		{"number one", map[string]any{"all_findings": float64(1)}, notBoolean},
+		{"string false with finding_uuids", map[string]any{"all_findings": "false", "finding_uuids": []any{"u-1"}}, notBoolean},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1"}
+			maps.Copy(args, tt.args)
+			app, fake := newScriptedGitLab(t, nil, nil)
+			res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(args))
+			if msg := errorText(t, res, err); msg != tt.want {
+				t.Errorf("message = %q, want %q", msg, tt.want)
+			}
+			if n := len(fake.graphQLCalls()); n != 0 {
+				t.Errorf("%d requests were sent; must not call GitLab", n)
+			}
+		})
+	}
+}
+
+func TestStartVulnerabilityWorkflow_AllFindingsFalseKeepsTheUUIDs(t *testing.T) {
+	app, fake := newScriptedGitLab(t, []string{projectIDResponse, workflowStarted}, nil)
+	res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "finding_uuids": []any{"u-1"}, "all_findings": false,
+	}))
+	resultText(t, res, err)
+	if got := fake.lastCall(t).Variables["findingUuids"]; !reflect.DeepEqual(got, []any{"u-1"}) {
+		t.Errorf("findingUuids = %v", got)
+	}
+}
+
+func TestStartVulnerabilityWorkflow_SeveritiesAreUppercasedAndOptional(t *testing.T) {
+	tests := []struct {
+		name       string
+		severities any
+		want       any // nil: severities must not be sent
+	}{
+		{"mixed case", []any{"critical", "High"}, []any{"CRITICAL", "HIGH"}},
+		{"empty list", []any{}, nil},
+		{"null", nil, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app, fake := newScriptedGitLab(t, []string{projectIDResponse, workflowStarted}, nil)
+			res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+				"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "finding_uuids": []any{"u-1"},
+				"severities": tt.severities,
+			}))
+			resultText(t, res, err)
+			got, present := fake.lastCall(t).Variables["severities"]
+			if tt.want == nil && present {
+				t.Errorf("severities = %v, it must not be sent", got)
+			}
+			if tt.want != nil && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("severities = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStartVulnerabilityWorkflow_SendsWorkflowWithoutExtraVariables(t *testing.T) {
+	app, fake := newScriptedGitLab(t, []string{projectIDResponse, workflowStarted}, nil)
+	res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": " acme/app ", "workflow": "RESOLVE_SAST_VULNERABILITY_V1", "finding_uuids": []any{"u-1"},
+	}))
+	resultText(t, res, err)
+	calls := fake.graphQLCalls()
+	if len(calls) != 2 || calls[0].Variables["fullPath"] != "acme/app" {
+		t.Fatalf("calls = %+v, want the project lookup then the mutation", calls)
+	}
+	want := map[string]any{
+		"projectId":    "gid://gitlab/Project/9",
+		"workflow":     "RESOLVE_SAST_VULNERABILITY_V1",
+		"findingUuids": []any{"u-1"},
+	}
+	if !reflect.DeepEqual(calls[1].Variables, want) {
+		t.Errorf("variables = %v, want %v", calls[1].Variables, want)
+	}
+}
+
+// workflowMutations are the two write tools of a vulnerability workflow, each
+// with valid arguments.
+var workflowMutations = []struct {
+	tool    string
+	field   string // payload field of the mutation
+	action  string // verb of its "Failed to ..." error
+	handler toolHandler
+	args    map[string]any
+}{
+	{"start_vulnerability_workflow", "startVulnerabilityWorkflow", "start", (*App).handleStartVulnerabilityWorkflow,
+		map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "finding_uuids": []any{"u-1"}}},
+	{"cancel_vulnerability_workflow", "cancelVulnerabilityWorkflow", "cancel", (*App).handleCancelVulnerabilityWorkflow,
+		map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1"}},
+}
+
+func TestVulnerabilityWorkflowMutations_UnknownProjectStopsBeforeMutation(t *testing.T) {
+	for _, wm := range workflowMutations {
+		t.Run(wm.tool, func(t *testing.T) {
+			args := maps.Clone(wm.args)
+			args["project_path"] = "acme/ghost"
+			app, fake := newScriptedGitLab(t, []string{`{"data":{"project":null}}`}, nil)
+			res, err := wm.handler(app, context.Background(), callTool(args))
+			if msg := errorText(t, res, err); msg != "Project 'acme/ghost' not found" {
+				t.Errorf("message = %q", msg)
+			}
+			if n := len(fake.graphQLCalls()); n != 1 {
+				t.Errorf("requests = %d, want only the project lookup", n)
+			}
+		})
+	}
+}
+
+func TestVulnerabilityWorkflowMutations_MissingPayloadIsNotSuccess(t *testing.T) {
+	for _, wm := range workflowMutations {
+		missingPayload := fmt.Sprintf("Unexpected GitLab response for %s: missing %q payload", wm.tool, wm.field)
+		missingExecution := fmt.Sprintf("Unexpected GitLab response for %s: missing \"execution\" in the payload", wm.tool)
+		responses := []struct {
+			name, body, want string
+		}{
+			{"null payload", fmt.Sprintf(`{"data":{%q:null}}`, wm.field), missingPayload},
+			{"no payload", `{"data":{}}`, missingPayload},
+			{"null execution without errors", fmt.Sprintf(`{"data":{%q:{"execution":null,"errorReason":null,"errors":[]}}}`, wm.field), missingExecution},
+			{"no execution", fmt.Sprintf(`{"data":{%q:{"errors":[]}}}`, wm.field), missingExecution},
+		}
+		for _, r := range responses {
+			t.Run(wm.tool+"/"+r.name, func(t *testing.T) {
+				app, _ := newScriptedGitLab(t, []string{projectIDResponse, r.body}, nil)
+				res, err := wm.handler(app, context.Background(), callTool(maps.Clone(wm.args)))
+				if msg := errorText(t, res, err); msg != r.want {
+					t.Errorf("message = %q, want %q", msg, r.want)
+				}
+			})
+		}
+	}
+}
+
+func TestVulnerabilityWorkflowMutations_PayloadErrorsAreToolErrors(t *testing.T) {
+	for _, wm := range workflowMutations {
+		failed := "Failed to " + wm.action + " workflow"
+		responses := []struct {
+			name, payload, want string
+		}{
+			{"reason and errors", `{"execution":null,"errorReason":"NOT_ALLOWED","errors":["No permission","Feature disabled"]}`,
+				failed + " (NOT_ALLOWED): No permission, Feature disabled"},
+			{"reason only", `{"execution":null,"errorReason":"NOT_ALLOWED","errors":[]}`, failed + " (NOT_ALLOWED)"},
+			{"errors only", `{"execution":null,"errorReason":null,"errors":["No permission"]}`, failed + ": No permission"},
+			{"reason next to an execution", `{"execution":{"executionId":"e-1"},"errorReason":"NOT_ALLOWED","errors":[]}`,
+				failed + " (NOT_ALLOWED) (executionId: e-1)"},
+			{"errors next to an execution", `{"execution":{"executionId":"e-2","status":"RUNNING"},"errorReason":null,"errors":["Batch failed"]}`,
+				failed + ": Batch failed (executionId: e-2)"},
+		}
+		for _, r := range responses {
+			t.Run(wm.tool+"/"+r.name, func(t *testing.T) {
+				body := fmt.Sprintf(`{"data":{%q:%s}}`, wm.field, r.payload)
+				app, _ := newScriptedGitLab(t, []string{projectIDResponse, body}, nil)
+				res, err := wm.handler(app, context.Background(), callTool(maps.Clone(wm.args)))
+				if msg := errorText(t, res, err); msg != r.want {
+					t.Errorf("message = %q, want %q", msg, r.want)
+				}
+			})
+		}
+	}
+}
+
+func TestCancelVulnerabilityWorkflow_SendsProjectAndWorkflow(t *testing.T) {
+	const cancelled = `{"data":{"cancelVulnerabilityWorkflow":{"execution":{"executionId":"e-1","status":"RUNNING","cancelRequested":true},"errorReason":null,"errors":[]}}}`
+	app, fake := newScriptedGitLab(t, []string{projectIDResponse, cancelled}, nil)
+	res, err := app.handleCancelVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SECRETS_FP_DETECTION_V1",
+	}))
+	if text := resultText(t, res, err); !strings.Contains(text, `"cancelRequested": true`) {
+		t.Errorf("result = %s", text)
+	}
+	calls := fake.graphQLCalls()
+	want := map[string]any{"projectId": "gid://gitlab/Project/9", "workflow": "SECRETS_FP_DETECTION_V1"}
+	if len(calls) != 2 || !reflect.DeepEqual(calls[1].Variables, want) {
+		t.Errorf("calls = %+v, want the project lookup then the mutation with %v", calls, want)
+	}
+}
+
+func TestVulnerabilityWorkflowTools_RequireProjectAndWorkflow(t *testing.T) {
+	handlers := map[string]toolHandler{
+		"start_vulnerability_workflow":  (*App).handleStartVulnerabilityWorkflow,
+		"get_vulnerability_workflow":    (*App).handleGetVulnerabilityWorkflow,
+		"cancel_vulnerability_workflow": (*App).handleCancelVulnerabilityWorkflow,
+	}
+	tests := []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{"no project_path", map[string]any{"workflow": "SAST_FP_DETECTION_V1"}, "project_path is required"},
+		{"blank project_path", map[string]any{"project_path": "  ", "workflow": "SAST_FP_DETECTION_V1"}, "project_path is required"},
+		{"no workflow", map[string]any{"project_path": "acme/app"}, "workflow is required"},
+		{"blank workflow", map[string]any{"project_path": "acme/app", "workflow": " "}, "workflow is required"},
+	}
+	for tool, handler := range handlers {
+		for _, tt := range tests {
+			t.Run(tool+"/"+tt.name, func(t *testing.T) {
+				args := maps.Clone(tt.args)
+				// A valid selection, so start_ can only fail on the argument under test.
+				args["all_findings"] = true
+				app, fake := newScriptedGitLab(t, nil, nil)
+				res, err := handler(app, context.Background(), callTool(args))
+				if msg := errorText(t, res, err); msg != tt.want {
+					t.Errorf("message = %q, want %q", msg, tt.want)
+				}
+				if n := len(fake.graphQLCalls()); n != 0 {
+					t.Errorf("%d requests were sent", n)
+				}
+			})
+		}
+	}
+}
+
+func TestGetVulnerabilityWorkflow_NullProjectIsPlainNotFound(t *testing.T) {
+	app, _ := newFakeGitLab(t, `{"data":{"project":null}}`)
+	res, err := app.handleGetVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/ghost", "workflow": "SAST_FP_DETECTION_V1",
+	}))
+	if msg := errorText(t, res, err); msg != "Project 'acme/ghost' not found" {
+		t.Errorf("message = %q", msg)
+	}
+}
+
+func TestGetVulnerabilityWorkflow_ReturnsExecution(t *testing.T) {
+	const execution = `{"data":{"project":{"vulnerabilityWorkflowExecution":{
+	  "executionId":"e-7","workflow":"SAST_FP_DETECTION_V1","status":"RUNNING",
+	  "progress":{"total":4,"completed":1,"percentage":25}}}}}`
+
+	// Without execution_id: the latest execution, so executionId is not sent.
+	app, fake := newFakeGitLab(t, execution)
+	res, err := app.handleGetVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1",
+	}))
+	if text := resultText(t, res, err); !strings.Contains(text, `"status": "RUNNING"`) || !strings.Contains(text, `"percentage": 25`) {
+		t.Errorf("result = %s", text)
+	}
+	want := map[string]any{"fullPath": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "withItems": false}
+	if vars := fake.lastCall(t).Variables; !reflect.DeepEqual(vars, want) {
+		t.Errorf("variables = %v, want %v", vars, want)
+	}
+
+	// With execution_id: that execution.
+	app, fake = newFakeGitLab(t, execution)
+	res, err = app.handleGetVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "execution_id": "e-7",
+	}))
+	resultText(t, res, err)
+	if got := fake.lastCall(t).Variables["executionId"]; got != "e-7" {
+		t.Errorf("executionId = %v, want e-7", got)
+	}
+}
+
+func TestGetVulnerabilityWorkflow_ExecutionIDMustBeAString(t *testing.T) {
+	// A dropped execution_id would silently answer with the latest execution.
+	app, fake := newScriptedGitLab(t, nil, nil)
+	res, err := app.handleGetVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "execution_id": float64(7),
+	}))
+	if msg := errorText(t, res, err); msg != "execution_id must be a string" {
+		t.Errorf("message = %q", msg)
+	}
+	if n := len(fake.graphQLCalls()); n != 0 {
+		t.Errorf("%d requests were sent", n)
+	}
+}
+
+func TestVulnerabilityWorkflowTools_DeclareWorkflowEnum(t *testing.T) {
+	tools := registeredTools(t)
+	wantWorkflows := []any{"SAST_FP_DETECTION_V1", "SECRETS_FP_DETECTION_V1", "RESOLVE_SAST_VULNERABILITY_V1"}
+	for _, name := range []string{"start_vulnerability_workflow", "get_vulnerability_workflow", "cancel_vulnerability_workflow"} {
+		tool, ok := tools[name]
+		if !ok {
+			t.Errorf("%s is not registered", name)
+			continue
+		}
+		if !slices.Contains(tool.InputSchema.Required, "project_path") || !slices.Contains(tool.InputSchema.Required, "workflow") {
+			t.Errorf("%s: required = %v, want project_path and workflow", name, tool.InputSchema.Required)
+		}
+		workflow, _ := tool.InputSchema.Properties["workflow"].(map[string]any)
+		if !reflect.DeepEqual(workflow["enum"], wantWorkflows) {
+			t.Errorf("%s: workflow enum = %v", name, workflow["enum"])
+		}
+	}
+	start := tools["start_vulnerability_workflow"].InputSchema.Properties
+	if all, _ := start["all_findings"].(map[string]any); all["type"] != "boolean" {
+		t.Errorf("all_findings schema = %v, want a boolean parameter", start["all_findings"])
+	}
+}
+
+// startArgs are valid start_vulnerability_workflow arguments with an explicit
+// scope.
+func startArgs() map[string]any {
+	return map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "finding_uuids": []any{"u-1"}}
+}
+
+// startOutcome is the success result of start_vulnerability_workflow.
+type startOutcome struct {
+	Requested map[string]any `json:"requested"`
+	Execution map[string]any `json:"execution"`
+}
+
+// decodeStartResult decodes the text of a successful
+// start_vulnerability_workflow result.
+func decodeStartResult(t *testing.T, text string) startOutcome {
+	t.Helper()
+	var got startOutcome
+	if err := json.Unmarshal([]byte(text), &got); err != nil {
+		t.Fatalf("decoding the result: %v\n%s", err, text)
+	}
+	return got
+}
+
+func TestStartVulnerabilityWorkflow_RejectsUnknownArguments(t *testing.T) {
+	// A misspelled filter must never be dropped: the billed run would cover
+	// more findings than the caller asked for.
+	tests := []struct {
+		name  string
+		extra map[string]any
+		want  string
+	}{
+		{"severity instead of severities", map[string]any{"severity": []any{"CRITICAL"}},
+			`unknown argument "severity"; did you mean "severities"?`},
+		{"one unknown key", map[string]any{"execution_id": "e-1"}, `unknown argument "execution_id"`},
+		{"several unknown keys, sorted", map[string]any{"scope": "all", "dry_run": true, "include_items": true},
+			`unknown arguments "dry_run", "include_items", "scope"`},
+		{"several with severity", map[string]any{"severity": "HIGH", "batch": 5},
+			`unknown arguments "batch", "severity"; did you mean "severities"?`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "all_findings": true}
+			maps.Copy(args, tt.extra)
+			app, fake := newScriptedGitLab(t, nil, nil)
+			res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(args))
+			if msg := errorText(t, res, err); msg != tt.want {
+				t.Errorf("message = %q, want %q", msg, tt.want)
+			}
+			if n := len(fake.graphQLCalls()); n != 0 {
+				t.Errorf("%d requests were sent; must not call GitLab", n)
+			}
+		})
+	}
+}
+
+func TestStartVulnerabilityWorkflow_SchemaAllowsOnlyDeclaredArguments(t *testing.T) {
+	schema := registeredTools(t)["start_vulnerability_workflow"].InputSchema
+	if schema.AdditionalProperties != false {
+		t.Errorf("additionalProperties = %v, want false", schema.AdditionalProperties)
+	}
+	// The handler accepts exactly the declared parameters.
+	declared := slices.Sorted(maps.Keys(schema.Properties))
+	accepted := slices.Sorted(slices.Values(startWorkflowArguments))
+	if !slices.Equal(declared, accepted) {
+		t.Errorf("declared parameters = %v, accepted arguments = %v", declared, accepted)
+	}
+}
+
+func TestStartVulnerabilityWorkflow_FailedMutationRequestMayHaveStartedTheRun(t *testing.T) {
+	const mayHaveStarted = " The run may have started: check get_vulnerability_workflow before retrying."
+	const graphQLError = `{"errors":[{"message":"Internal server error"}]}`
+
+	app, fake := newScriptedGitLab(t, []string{projectIDResponse, graphQLError}, nil)
+	res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(startArgs()))
+	if msg := errorText(t, res, err); msg != "start_vulnerability_workflow: Internal server error"+mayHaveStarted {
+		t.Errorf("message = %q", msg)
+	}
+	if n := len(fake.graphQLCalls()); n != 2 {
+		t.Errorf("requests = %d, want the project lookup then the mutation", n)
+	}
+
+	// A failed project lookup never reached the mutation.
+	app, fake = newScriptedGitLab(t, []string{graphQLError}, nil)
+	res, err = app.handleStartVulnerabilityWorkflow(context.Background(), callTool(startArgs()))
+	if msg := errorText(t, res, err); strings.Contains(msg, "may have started") || len(fake.graphQLCalls()) != 1 {
+		t.Errorf("lookup failure: message = %q after %d requests", msg, len(fake.graphQLCalls()))
+	}
+
+	// Cancel starts nothing.
+	app, _ = newScriptedGitLab(t, []string{projectIDResponse, graphQLError}, nil)
+	res, err = app.handleCancelVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+		"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1",
+	}))
+	if msg := errorText(t, res, err); msg != "cancel_vulnerability_workflow: Internal server error" {
+		t.Errorf("cancel: message = %q", msg)
+	}
+}
+
+func TestStartVulnerabilityWorkflow_ResultRecordsTheRequest(t *testing.T) {
+	tests := []struct {
+		name      string
+		selection map[string]any
+		want      map[string]any
+	}{
+		{"finding_uuids", map[string]any{"finding_uuids": []any{"u-1", "u-2"}},
+			map[string]any{"scope": "2 finding_uuids", "severities": []any{}}},
+		{"all_findings with severities", map[string]any{"all_findings": true, "severities": []any{"critical", "HIGH"}},
+			map[string]any{"scope": "all_findings", "severities": []any{"CRITICAL", "HIGH"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := map[string]any{"project_path": " acme/app ", "workflow": "RESOLVE_SAST_VULNERABILITY_V1"}
+			maps.Copy(args, tt.selection)
+			app, _ := newScriptedGitLab(t, []string{projectIDResponse, workflowStarted}, nil)
+			res, err := app.handleStartVulnerabilityWorkflow(context.Background(), callTool(args))
+
+			text := resultText(t, res, err)
+			got := decodeStartResult(t, text)
+			want := map[string]any{"project_path": "acme/app", "workflow": "RESOLVE_SAST_VULNERABILITY_V1"}
+			maps.Copy(want, tt.want)
+			if !reflect.DeepEqual(got.Requested, want) {
+				t.Errorf("requested = %v, want %v", got.Requested, want)
+			}
+			if !reflect.DeepEqual(got.Execution, map[string]any{"executionId": "e-1", "status": "CREATED"}) {
+				t.Errorf("execution = %v", got.Execution)
+			}
+			if strings.Index(text, `"requested"`) > strings.Index(text, `"execution"`) {
+				t.Errorf("the request must come before the execution: %s", text)
+			}
+		})
+	}
+}
+
+func TestStartVulnerabilityWorkflow_DescriptionAsksForConfirmation(t *testing.T) {
+	tool := registeredTools(t)["start_vulnerability_workflow"]
+	for _, phrase := range []string{
+		"Every call starts a new billed run that consumes GitLab Credits",
+		"confirm the project, the workflow and the scope with the user",
+		"set all_findings=true only when the user asked for the whole project",
+		"Report the returned executionId",
+	} {
+		if !strings.Contains(tool.Description, phrase) {
+			t.Errorf("description lacks %q: %s", phrase, tool.Description)
+		}
+	}
+	params := map[string]string{
+		"all_findings": "only when the user asked",
+		"severities":   "never starts a run on its own",
+	}
+	for param, phrase := range params {
+		prop, _ := tool.InputSchema.Properties[param].(map[string]any)
+		if desc, _ := prop["description"].(string); !strings.Contains(desc, phrase) {
+			t.Errorf("%s description = %q, want it to say %q", param, desc, phrase)
+		}
+	}
+}
+
+func TestGetVulnerabilityWorkflow_ItemStatesOnlyOnRequest(t *testing.T) {
+	if !strings.Contains(queryVulnerabilityWorkflowExecution, "$withItems: Boolean!") ||
+		!strings.Contains(queryVulnerabilityWorkflowExecution, "itemStates @include(if: $withItems)") {
+		t.Fatalf("itemStates must be requested only through @include(if: $withItems):\n%s", queryVulnerabilityWorkflowExecution)
+	}
+	tests := []struct {
+		name  string
+		extra map[string]any
+		want  bool
+	}{
+		{"absent", map[string]any{}, false},
+		{"null", map[string]any{"include_items": nil}, false},
+		{"false", map[string]any{"include_items": false}, false},
+		{"true", map[string]any{"include_items": true}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := map[string]any{"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1"}
+			maps.Copy(args, tt.extra)
+			app, fake := newFakeGitLab(t, `{"data":{"project":{"vulnerabilityWorkflowExecution":{"executionId":"e-7"}}}}`)
+			res, err := app.handleGetVulnerabilityWorkflow(context.Background(), callTool(args))
+			resultText(t, res, err)
+			if got, present := fake.lastCall(t).Variables["withItems"]; !present || got != tt.want {
+				t.Errorf("withItems = %v (present: %t), want %t", got, present, tt.want)
+			}
+		})
+	}
+
+	prop, _ := registeredTools(t)["get_vulnerability_workflow"].InputSchema.Properties["include_items"].(map[string]any)
+	if prop["type"] != "boolean" {
+		t.Errorf("include_items schema = %v, want a boolean parameter", prop)
+	}
+}
+
+func TestGetVulnerabilityWorkflow_IncludeItemsIsAStrictBoolean(t *testing.T) {
+	for _, value := range []any{"true", float64(1), []any{true}} {
+		t.Run(fmt.Sprintf("%T", value), func(t *testing.T) {
+			app, fake := newScriptedGitLab(t, nil, nil)
+			res, err := app.handleGetVulnerabilityWorkflow(context.Background(), callTool(map[string]any{
+				"project_path": "acme/app", "workflow": "SAST_FP_DETECTION_V1", "include_items": value,
+			}))
+			if msg := errorText(t, res, err); msg != "include_items must be a boolean" {
+				t.Errorf("message = %q", msg)
+			}
+			if n := len(fake.graphQLCalls()); n != 0 {
+				t.Errorf("%d requests were sent", n)
+			}
+		})
+	}
+}

@@ -1,0 +1,12 @@
+title = "gitlab-mcp-plus"
+
+[extend]
+useDefault = true
+
+# GitLab Duo workflow names, not credentials: generic-api-key flags the value
+# that follows "SECRETS_FP_DETECTION_V1" in the list of workflows. Only these
+# exact values are exempt.
+[[allowlists]]
+description = "GitLab Duo vulnerability workflow names"
+regexTarget = "secret"
+regexes = ['''^(SAST_FP_DETECTION_V1|SECRETS_FP_DETECTION_V1|RESOLVE_SAST_VULNERABILITY_V1)$''']
