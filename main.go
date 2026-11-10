@@ -1,20 +1,20 @@
+// Command gitlab-mcp-plus is an MCP server that extends the official GitLab MCP
+// server with security, compliance and GitLab Duo tools. Run with no arguments
+// it serves over stdio; --install and the other flags register it in MCP
+// clients.
 package main
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"math"
-	"net/http"
 	"os"
-	"strings"
-	"time"
+	"runtime"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/slackwero/gitlab-mcp-plus/internal/gitlab"
+	"github.com/slackwero/gitlab-mcp-plus/internal/setup"
+	"github.com/slackwero/gitlab-mcp-plus/internal/tools"
 )
 
 // Variables injected at build time via -ldflags. A binary built locally with
@@ -25,363 +25,65 @@ var (
 	BuildDate = "unknown"
 )
 
-// defaultMaxResponseBytes caps what is read from a single GitLab response, so
-// a misbehaving instance or proxy cannot exhaust the memory of the server.
-const defaultMaxResponseBytes = 32 << 20
+const usageHelp = `gitlab-mcp-plus — MCP server that extends the official GitLab MCP with security, compliance and GitLab Duo operations
 
-type App struct {
-	token     string
-	endpoint  string
-	gitlabURL string
-	client    *http.Client
+Usage:
+  gitlab-mcp-plus                                    Start the MCP server (stdio)
+  gitlab-mcp-plus --version                          Print the version and exit
+  gitlab-mcp-plus --help                             Show this help
 
-	maxResponseBytes int64
-}
+  gitlab-mcp-plus --install      <claude|cursor>     Install the MCP server in the client
+  gitlab-mcp-plus --uninstall    <claude|cursor>     Remove the registration from the client
+  gitlab-mcp-plus --check        <claude|cursor>     Diagnose an installation
+  gitlab-mcp-plus --print-config <claude|cursor>     Print the manual configuration
 
-func NewApp(token, gitlabURL string) *App {
-	if gitlabURL == "" {
-		gitlabURL = "https://gitlab.com"
-	}
-	return &App{
-		token:     token,
-		endpoint:  gitlabURL + "/api/graphql",
-		gitlabURL: gitlabURL,
-		client:    &http.Client{Timeout: 30 * time.Second},
+Flags:
+  --version                Print the version and exit
+  --help, -h               Show this help
 
-		maxResponseBytes: defaultMaxResponseBytes,
-	}
-}
+  --install <client>       Install the MCP server in claude or cursor
+  --uninstall <client>     Uninstall the MCP server from the client
+  --check <client>         Check the registration, client availability, binary and token
+  --print-config <client>  Print the command or JSON to configure it manually
 
-// readBody reads a GitLab response body, refusing one larger than
-// maxResponseBytes instead of buffering it whole.
-func (a *App) readBody(resp *http.Response) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, a.maxResponseBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-	if int64(len(body)) > a.maxResponseBytes {
-		return nil, fmt.Errorf("GitLab response is larger than %d bytes", a.maxResponseBytes)
-	}
-	return body, nil
-}
+  --name <string>          MCP server name (default: gitlab-mcp-plus)
+  --scope <user|project>   Scope to register in (default: user; claude also accepts 'local')
+  --gitlab-token <string>  Overrides $GITLAB_TOKEN
+  --gitlab-url <string>    Overrides $GITLAB_URL (default: https://gitlab.com)
+  --force, -f              Overwrite an existing registration
+  --yes, -y                Skip interactive confirmations
+  --no-validate            Do not validate the GitLab token against the API before installing
+  --read-only              Register the server with only its read tools
+  --tools <a,b,...>        Register the server with only these tools
 
-func (a *App) graphql(ctx context.Context, query string, variables map[string]any) (map[string]any, error) {
-	body := map[string]any{
-		"query":     query,
-		"variables": variables,
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
+Environment variables:
+  GITLAB_TOKEN             Token with the 'api' scope ('read_api' for read-only use); required to serve
+  GITLAB_URL               GitLab instance URL, https only (default: https://gitlab.com)
+  GITLAB_MCP_READ_ONLY     true: do not expose the tools that change data
+  GITLAB_MCP_TOOLS         Comma-separated allowlist of the tools to expose
 
-	req, err := http.NewRequestWithContext(ctx, "POST", a.endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+a.token)
+Examples:
+  # Serve the MCP (normal use from Claude Code / Cursor)
+  GITLAB_TOKEN=glpat-xxx gitlab-mcp-plus
 
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("execute request: %w", err)
-	}
-	defer resp.Body.Close()
+  # Automatic installation in Claude Code
+  GITLAB_TOKEN=glpat-xxx gitlab-mcp-plus --install claude
 
-	respBody, err := a.readBody(resp)
-	if err != nil {
-		return nil, err
-	}
+  # Installation in Cursor with project scope (the file references $GITLAB_TOKEN)
+  gitlab-mcp-plus --install cursor --scope project
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitLab API %d: %s", resp.StatusCode, string(respBody))
-	}
+  # Reinstall without prompting
+  gitlab-mcp-plus --install claude --force --yes
 
-	var result map[string]any
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w", err)
-	}
+  # Expose only the read tools
+  gitlab-mcp-plus --install claude --read-only
 
-	if errs, ok := result["errors"]; ok {
-		if errList, ok := errs.([]any); ok && len(errList) > 0 {
-			var msgs []string
-			for _, e := range errList {
-				if em, ok := e.(map[string]any); ok {
-					if msg, ok := em["message"].(string); ok {
-						msgs = append(msgs, msg)
-					}
-				}
-			}
-			return nil, fmt.Errorf("%s", strings.Join(msgs, "; "))
-		}
-	}
+  # Diagnose an existing installation
+  gitlab-mcp-plus --check claude
 
-	data, ok := result["data"]
-	if !ok {
-		return nil, fmt.Errorf("no data returned from GitLab GraphQL API")
-	}
-
-	dataMap, ok := data.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("unexpected data format from GitLab GraphQL API")
-	}
-
-	return dataMap, nil
-}
-
-func (a *App) rest(ctx context.Context, method, path string, body any) (map[string]any, error) {
-	url := a.gitlabURL + "/api/v4" + path
-
-	var reader io.Reader
-	if body != nil {
-		payload, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("marshal request: %w", err)
-		}
-		reader = bytes.NewReader(payload)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+a.token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := a.readBody(resp)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("GitLab REST %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	if len(respBody) == 0 {
-		return map[string]any{}, nil
-	}
-
-	var result map[string]any
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w", err)
-	}
-	return result, nil
-}
-
-// restList runs a REST GET whose response is a JSON array and also returns the
-// X-Next-Page header for offset pagination.
-func (a *App) restList(ctx context.Context, path string) ([]any, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.gitlabURL+"/api/v4"+path, nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+a.token)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := a.readBody(resp)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, "", fmt.Errorf("GitLab REST %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result []any
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, "", fmt.Errorf("unmarshal response: %w", err)
-	}
-	return result, resp.Header.Get("X-Next-Page"), nil
-}
-
-func okResult(data interface{}) *mcp.CallToolResult {
-	b, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return errResult(fmt.Sprintf("marshal result: %v", err))
-	}
-	return mcp.NewToolResultText(string(b))
-}
-
-func errResult(message string) *mcp.CallToolResult {
-	r := mcp.NewToolResultText(message)
-	r.IsError = true
-	return r
-}
-
-func normalizeVulnID(id string) string {
-	if strings.HasPrefix(id, "gid://") {
-		return id
-	}
-	return "gid://gitlab/Vulnerability/" + id
-}
-
-func resolveScope(args map[string]interface{}) (string, string, error) {
-	project, _ := args["project_path"].(string)
-	group, _ := args["group_path"].(string)
-
-	if project != "" && group != "" {
-		return "", "", fmt.Errorf("provide either project_path or group_path, not both")
-	}
-	if project != "" {
-		return "project", project, nil
-	}
-	if group != "" {
-		return "group", group, nil
-	}
-	return "", "", fmt.Errorf("either project_path or group_path is required")
-}
-
-type aiRates struct {
-	acceptance    float64
-	locAcceptance float64
-	satisfaction  float64
-}
-
-func calculateAIRates(shown, accepted, shownLOC, acceptedLOC, thumbsUp, thumbsDown int) aiRates {
-	var r aiRates
-	if shown > 0 {
-		r.acceptance = round2(float64(accepted) / float64(shown) * 100)
-	}
-	if shownLOC > 0 {
-		r.locAcceptance = round2(float64(acceptedLOC) / float64(shownLOC) * 100)
-	}
-	if thumbsUp+thumbsDown > 0 {
-		r.satisfaction = round2(float64(thumbsUp) / float64(thumbsUp+thumbsDown) * 100)
-	}
-	return r
-}
-
-func buildAIDashboard(metrics map[string]interface{}, periodLabel string) map[string]interface{} {
-	cs := mapGet(metrics, "codeSuggestions")
-	cr := mapGet(metrics, "codeReview")
-	apChats := mapGet(metrics, "agentPlatformChats")
-	apFlows := mapGet(metrics, "agentPlatformFlows")
-	ap := mapGet(metrics, "agentPlatform")
-	chat := mapGet(metrics, "chat")
-	mcpCalls := mapGet(metrics, "mcp")
-	troubleshoot := mapGet(metrics, "troubleshoot")
-
-	shown := intGet(cs, "shownCount")
-	accepted := intGet(cs, "acceptedCount")
-	shownLOC := intGet(cs, "shownLinesOfCode")
-	acceptedLOC := intGet(cs, "acceptedLinesOfCode")
-	thumbsUp := intGet(cr, "reactThumbsUpOnDuoCodeReviewCommentEventCount")
-	thumbsDown := intGet(cr, "reactThumbsDownOnDuoCodeReviewCommentEventCount")
-
-	rates := calculateAIRates(shown, accepted, shownLOC, acceptedLOC, thumbsUp, thumbsDown)
-
-	dashboard := map[string]interface{}{
-		"summary": map[string]interface{}{
-			"duoUsedCount":                metrics["duoUsedCount"],
-			"duoChatContributorsCount":    metrics["duoChatContributorsCount"],
-			"rootCauseAnalysisUsersCount": metrics["rootCauseAnalysisUsersCount"],
-			"codeContributorsCount":       metrics["codeContributorsCount"],
-		},
-		"chat": map[string]interface{}{
-			"requestCount":       chat["requestDuoChatResponseEventCount"],
-			"responseCount":      chat["completeDuoChatResponseEventCount"],
-			"toolSucceededCount": chat["toolSucceededDuoChatEventCount"],
-			"toolFailedCount":    chat["toolFailedDuoChatEventCount"],
-		},
-		"mcp": map[string]interface{}{
-			"toolCallsStarted":  mcpCalls["startMcpToolCallEventCount"],
-			"toolCallsFinished": mcpCalls["finishMcpToolCallEventCount"],
-		},
-		"troubleshoot": map[string]interface{}{
-			"jobCount": troubleshoot["troubleshootJobEventCount"],
-		},
-		"codeSuggestions": map[string]interface{}{
-			"contributorsCount":   cs["contributorsCount"],
-			"shownCount":          shown,
-			"acceptedCount":       accepted,
-			"acceptanceRate":      rates.acceptance,
-			"shownLinesOfCode":    shownLOC,
-			"acceptedLinesOfCode": acceptedLOC,
-			"locAcceptanceRate":   rates.locAcceptance,
-			"languageBreakdown":   cs["languages"],
-			"ideNames":            cs["ideNames"],
-		},
-		"codeReview": map[string]interface{}{
-			"requestByAuthorCount":    cr["requestReviewDuoCodeReviewOnMrByAuthorEventCount"],
-			"requestByNonAuthorCount": cr["requestReviewDuoCodeReviewOnMrByNonAuthorEventCount"],
-			"commentsPostedCount":     cr["postCommentDuoCodeReviewOnDiffEventCount"],
-			"commentsPublishedCount":  cr["publishDuoCodeReviewCommentsEventCount"],
-			"approvalsCount":          cr["approveMergeRequestDuoCodeReviewEventCount"],
-			"noIssuesFoundCount":      cr["findNoIssuesDuoCodeReviewAfterReviewEventCount"],
-			"errorCount":              cr["encounterDuoCodeReviewErrorDuringReviewEventCount"],
-			"thumbsUp":                thumbsUp,
-			"thumbsDown":              thumbsDown,
-			"satisfactionRate":        rates.satisfaction,
-		},
-		"agentPlatform": map[string]interface{}{
-			"chatSessionsCreated": apChats["createdSessionEventCount"],
-			"flowSessionsCreated": apFlows["createdSessionEventCount"],
-			"sessions": map[string]interface{}{
-				"created":  ap["createdSessionEventCount"],
-				"started":  ap["startedSessionEventCount"],
-				"finished": ap["finishedSessionEventCount"],
-				"dropped":  ap["droppedSessionEventCount"],
-				"stopped":  ap["stoppedSessionEventCount"],
-				"resumed":  ap["resumedSessionEventCount"],
-			},
-			"flowMetrics": ap["flowMetrics"],
-		},
-	}
-
-	if periodLabel != "" {
-		dashboard["period"] = periodLabel
-	}
-
-	return dashboard
-}
-
-func mapGet(m map[string]interface{}, key string) map[string]interface{} {
-	if m == nil {
-		return map[string]interface{}{}
-	}
-	v, ok := m[key]
-	if !ok || v == nil {
-		return map[string]interface{}{}
-	}
-	if result, ok := v.(map[string]interface{}); ok {
-		return result
-	}
-	return map[string]interface{}{}
-}
-
-func intGet(m map[string]interface{}, key string) int {
-	v, ok := m[key]
-	if !ok || v == nil {
-		return 0
-	}
-	switch n := v.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	case json.Number:
-		i, _ := n.Int64()
-		return int(i)
-	}
-	return 0
-}
-
-func round2(v float64) float64 {
-	return math.Round(v*100) / 100
-}
+  # Get the snippet for manual configuration
+  gitlab-mcp-plus --print-config cursor
+`
 
 func main() {
 	var (
@@ -420,8 +122,8 @@ func main() {
 	flag.BoolVar(&yesFlag, "yes", false, "Skip interactive confirmations")
 	flag.BoolVar(&yesFlag, "y", false, "Skip interactive confirmations (alias)")
 	flag.BoolVar(&noValidateFlag, "no-validate", false, "Do not validate the GitLab token against the API")
-	flag.BoolVar(&readOnlyFlag, "read-only", false, "Register the server with only its read tools ("+envReadOnly+"=true)")
-	flag.StringVar(&toolsFlag, "tools", "", "Register the server with only these comma-separated tools ("+envTools+")")
+	flag.BoolVar(&readOnlyFlag, "read-only", false, "Register the server with only its read tools ("+tools.EnvReadOnly+"=true)")
+	flag.StringVar(&toolsFlag, "tools", "", "Register the server with only these comma-separated tools ("+tools.EnvTools+")")
 
 	flag.Usage = printHelp
 	flag.Parse()
@@ -440,7 +142,7 @@ func main() {
 			"prefer exporting GITLAB_TOKEN or the hidden prompt")
 	}
 
-	opts := adminOpts{
+	opts := setup.Options{
 		Name:       serverNameFlag,
 		Scope:      scopeFlag,
 		Token:      gitlabTokenFlag,
@@ -454,13 +156,13 @@ func main() {
 
 	switch {
 	case installFlag != "":
-		exitOn(runInstall(installFlag, opts))
+		exitOn(setup.Install(installFlag, opts))
 	case uninstallFlag != "":
-		exitOn(runUninstall(uninstallFlag, opts))
+		exitOn(setup.Uninstall(uninstallFlag, opts))
 	case checkFlag != "":
-		exitOn(runCheck(checkFlag, opts))
+		exitOn(setup.Check(checkFlag, opts))
 	case printConfigFlag != "":
-		exitOn(runPrintConfig(printConfigFlag, opts))
+		exitOn(setup.PrintConfig(printConfigFlag, opts))
 	default:
 		runServer()
 	}
@@ -473,16 +175,16 @@ func runServer() {
 		os.Exit(1)
 	}
 
-	gitlabURL, err := normalizeGitLabURL(os.Getenv("GITLAB_URL"))
+	gitlabURL, err := gitlab.NormalizeURL(os.Getenv("GITLAB_URL"))
 	if err != nil {
 		exitServer(fmt.Errorf("GITLAB_URL: %w", err))
 	}
-	policy, err := toolPolicyFromEnv()
+	policy, err := tools.PolicyFromEnv()
 	if err != nil {
 		exitServer(err)
 	}
 
-	s := newServer(NewApp(token, gitlabURL), policy)
+	s := tools.NewServer(gitlab.NewClient(token, gitlabURL), policy, Version)
 	if err := server.ServeStdio(s); err != nil {
 		exitServer(err)
 	}
@@ -500,4 +202,13 @@ func exitOn(err error) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func printHelp() {
+	fmt.Fprint(os.Stdout, usageHelp)
+}
+
+func printVersion() {
+	fmt.Printf("gitlab-mcp-plus %s (commit %s, built %s, %s/%s)\n",
+		Version, Commit, BuildDate, runtime.GOOS, runtime.GOARCH)
 }

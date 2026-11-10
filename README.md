@@ -420,6 +420,17 @@ Then revoke the token in GitLab if you no longer need it.
 
 Requires Go 1.26 or later; the `toolchain` line of `go.mod` pins the patched release that CI, releases and local builds use (the `go` command downloads it automatically).
 
+### Project layout
+
+```
+main.go              flags, --version/--help and startup
+internal/gitlab/     GitLab API client: GraphQL, REST, URL and token validation
+internal/tools/      the MCP tools, one file per domain, and the server with its tool policy
+internal/setup/      --install, --uninstall, --check and --print-config for Claude Code and Cursor
+```
+
+Dependencies point one way: `main` uses `tools` and `setup`, and both use `gitlab`. Tests live next to the code they cover.
+
 ```bash
 make build                          # ./gitlab-mcp-plus
 go vet ./... && go test ./...       # unit tests, offline against a fake GitLab
