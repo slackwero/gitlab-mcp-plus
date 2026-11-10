@@ -5,6 +5,7 @@
 [![MCP tools](https://img.shields.io/badge/MCP%20tools-44-blue)](#tools)
 [![GitLab](https://img.shields.io/badge/GitLab-.com%20%7C%20self--managed-FC6D26)](#self-managed-gitlab)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-D97757?logo=claude&logoColor=white)](https://claude.com/product/claude-code)
 
 [![CI](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/ci.yml)
 [![Security](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/security.yml/badge.svg)](https://github.com/slackwero/gitlab-mcp-plus/actions/workflows/security.yml)
